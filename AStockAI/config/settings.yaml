@@ -1,0 +1,156 @@
+# =============================================================================
+# AStockAI V1.0 配置文件（UTF-8 编码）
+# 单位约定：*_mb = 十进制MB(1,000,000字节)；*_mib = 二进制MiB(1,048,576字节)；
+#           *_gb = 十进制GB(1,000,000,000字节)；*_sec = 秒；*_days = 天
+# 时间均为北京时间（HH:MM）。未知配置键会导致启动时报错，避免拼写错误被静默忽略。
+# 修改后可运行：python src\main.py --check-config  仅校验配置，不启动采集。
+# =============================================================================
+
+paths:
+  # 项目根目录。留空 = 使用 src 的上一级目录。也可写成 "E:/AStockAI"
+  root: ""
+  data_dir: "data"
+  db_file: "data/market.db"
+  work_data_dir: "work_data"      # 供 Claude 按需读取的规范化数据文件
+  logs_dir: "logs"
+  run_dir: "run"                  # 单实例锁文件、STOP 停止标记文件
+
+memory:
+  # 软阈值（十进制MB），口径 = max(受控进程私有提交内存合计, 工作集合计)
+  warn_mb: 750                    # 停止非必要数据加载
+  protect_mb: 850                 # 释放缓存并暂停大型计算
+  critical_mb: 950                # 仅保留必要任务；持续处于此级别则安全退出
+  # Windows Job Object 硬限制（二进制MiB），约束“已提交私有内存”，必须 < 1024
+  job_memory_limit_mib: 960       # 作业内全部进程合计
+  process_memory_limit_mib: 960   # 单个进程
+  max_active_processes: 4         # 作业内最多同时存在的进程数
+  working_set_hard_max_mib: 1000  # 主进程硬性工作集上限，0 表示不设置
+  require_hard_limit: true        # 无法建立硬限制时拒绝启动（推荐保持 true）
+  check_interval_sec: 5.0
+  private_ws_sample_interval_sec: 300.0
+  critical_exit_consecutive: 6
+  numeric_threads: 1              # numpy/BLAS 线程数（只影响本进程）
+
+datasource:
+  provider: "akshare"
+  http_connect_timeout_sec: 5.0
+  http_read_timeout_sec: 20.0
+  max_retries: 2                  # 每次请求最多额外重试 2 次（总计 3 次）
+  retry_backoff_sec: 3.0          # 重试等待：3s、6s
+  min_request_interval_sec: 0.6   # 两次接口调用之间的最小间隔（限流）
+  circuit_breaker_failures: 5     # 同一数据集连续失败 5 次后熔断
+  circuit_breaker_cooldown_sec: 300.0
+  spot_min_rows: 3000             # 全A快照少于该行数视为不完整（invalid）
+  stale_after_sec: 180.0          # 交易时段内内容 180 秒完全不变 → stale
+  minute_realtime_max_lag_sec: 150.0
+  daily_adjust: "qfq"             # qfq 前复权 / hfq 后复权 / "" 不复权
+  index_codes: ["000001", "399001", "399006"]   # 上证指数、深证成指、创业板指
+  benchmark_index: "000001"       # 相对强弱基准
+  calendar_weekday_fallback: true # 交易日历不可用时临时按工作日判断（会在状态中标记）
+
+schedule:
+  tick_sec: 1.0
+  spot_interval_sec: 60.0         # 普通行情（全A快照）更新间隔
+  watchlist_interval_sec: 30.0    # 重点观察股票（分钟K线）更新间隔
+  index_interval_sec: 60.0
+  industry_interval_sec: 120.0
+  snapshot_store_interval_sec: 300.0   # 全A快照入库间隔（内存中仍每60秒更新）
+  screening_interval_sec: 900.0        # 盘中筛选间隔
+  export_interval_sec: 60.0            # work_data 状态文件与 manifest 刷新间隔
+  call_auction_snapshot: true          # 09:25–09:30 采集一次集合竞价结果快照
+  post_close_start: "15:35"            # 日K/指标等收盘后任务最早开始时间
+  cleanup_start: "15:30"               # 自动清理窗口（不得早于 15:30）
+  cleanup_end: "23:30"
+  daily_update_batch_size: 40          # 每批更新多少只股票的日K（批间让出调度）
+  indicator_batch_size: 200
+  industry_members_batch_size: 5
+  daily_history_days: 400              # 首次回填的自然日跨度
+  max_backoff_sec: 900.0
+  daily_job_max_attempts: 3
+  daily_update_scope: "all"            # all = 全部A股；focus = 自选股 + 最近一次筛选候选
+
+watchlist:
+  # 重点观察股票，6 位代码务必加引号，例如 "600519"、"000001"
+  codes: []
+  max_size: 20
+
+indicators:
+  trading_days_per_year: 252
+  breakout_volume_multiple: 1.8   # 放量突破：当日量 ≥ 1.8 × 前5日均量
+  pullback_volume_multiple: 0.7   # 缩量回踩：当日量 ≤ 0.7 × 前5日均量
+  pullback_ma_tolerance: 0.02
+  history_load_days: 220          # 计算指标时读取的自然日跨度（≥150）
+  store_recent_rows: 5
+  min_bars_full: 60
+
+screener:
+  model_version: "v1.0-initial-hypothesis"
+  # 权重合计必须为 100；属于初始研究假设，可调整后回测验证
+  weight_sector: 25.0
+  weight_volume_price: 25.0
+  weight_market: 20.0
+  weight_catalyst: 15.0           # V1.0 无可靠新闻/基本面数据源 → 一律标记缺失，不计分
+  weight_risk_reward: 15.0
+  top_n: 100
+  exclude_st: true
+  include_bse: false              # 是否包含北交所
+  min_amount_yuan: 50000000.0     # 成交额低于 5000 万元不参与排名
+  min_available_ratio: 0.6        # 可计算分值不足满分 60% 的股票不参与排名
+  volume_ratio_low: 1.2
+  volume_ratio_high: 3.0
+  rsi_low: 50.0
+  rsi_high: 75.0
+  breadth_bear: 0.3
+  breadth_bull: 0.7
+  rr_full_score_ratio: 3.0
+  vol_low: 0.30
+  vol_high: 0.80
+
+anomaly:
+  breakout_volume_ratio: 2.0
+  breakout_buffer: 0.0
+  pullback_volume_ratio_max: 0.8
+  pullback_ma_tolerance: 0.015
+  support_break_buffer: 0.005
+  spike_min_high_pct: 5.0
+  spike_min_fade_pct: 3.0
+  sector_min_pct: 2.0
+  sector_min_up_ratio: 0.75
+  sector_min_strong_members: 3
+  sector_member_min_pct: 5.0
+  breadth_bad_ratio: 0.30
+  breadth_drop_from_peak: 0.25
+  max_events_per_run: 300
+  min_amount_yuan: 20000000.0
+
+storage:
+  db_max_gb: 2.0                  # 数据库（含 -wal/-shm）容量上限，达到后暂停行情写入
+  db_soft_limit_gb: 1.8           # 超过后执行紧急清理（只清理高频快照/分钟线）
+  sqlite_cache_kib: 16384         # SQLite 页缓存上限 16 MiB
+  cleanup_batch_rows: 20000
+  incremental_vacuum_pages: 50000
+  full_vacuum_freelist_ratio: 0.3
+  retention_spot_days: 3          # 实时行情快照
+  retention_minute_days: 7        # 分钟K线
+  retention_daily_days: 365       # 日K线、指数日K、技术指标
+  retention_anomaly_days: 30      # 异动记录
+  retention_screen_days: 90       # 筛选结果
+  retention_log_days: 7           # 程序日志
+  retention_runs_days: 30         # 采集记录、进度、行业成分等运行数据
+  emergency_spot_days: 1
+  emergency_minute_days: 3
+
+export:
+  enabled: true
+  csv_encoding: "utf-8"           # 如需 Excel 直接打开不乱码，可改为 "utf-8-sig"
+  alerts_max: 500
+  candidates_max: 200
+  spot_valid_sec: 180.0           # 交易时段内行情文件的有效期
+  daily_valid_sec: 86400.0
+  replace_retries: 5
+  replace_retry_wait_sec: 0.2
+
+logging:
+  level: "INFO"
+  file_name: "astock.log"
+  retention_days: 7

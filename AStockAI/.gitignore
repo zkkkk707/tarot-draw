@@ -1,0 +1,13 @@
+# 运行期产生的数据，不纳入版本管理
+data/*
+!data/.gitkeep
+work_data/*
+!work_data/.gitkeep
+logs/*
+!logs/.gitkeep
+run/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+requirements.lock.txt

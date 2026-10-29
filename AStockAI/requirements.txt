@@ -1,0 +1,17 @@
+# AStockAI V1.0 运行依赖（Python 3.11+，Windows 11）
+# 本项目不会自动安装任何依赖；请按 README.md 的“安装步骤”在虚拟环境中手动安装。
+#
+# 行情数据源（开源接口封装库，底层为东方财富/新浪等公开网页接口）
+# 安装时会自动带入其依赖：lxml、beautifulsoup4、html5lib、jsonpath、openpyxl、
+# py_mini_racer、tqdm、xlrd、decorator、tabulate 等。首次安装后建议用
+# `pip freeze > requirements.lock.txt` 固定实际版本，避免上游接口变化带来意外。
+akshare>=1.14,<2.0
+# 数据处理
+pandas>=2.0,<3.0
+numpy>=1.24,<3.0
+# 进程内存监测
+psutil>=5.9
+# 配置文件解析
+PyYAML>=6.0
+# HTTP 客户端（AKShare 依赖；本项目用它注入默认超时）
+requests>=2.31
