@@ -96,6 +96,7 @@ def test_daily_update_batches_and_bounded_retries(settings: Settings, db: Databa
     bars_b = make_daily_bars("600001", 60, seed=2)
     adapter.daily = {"600000": bars_a, "600001": bars_b}
     target = date.fromisoformat(bars_a["trade_date"].iloc[-1])
+    settings.schedule.daily_retry_delay_sec = 0.0  # 测试中不等待重试间隔
     col, state = _collector(settings, db, adapter)
     # 收盘后快照：600000~600004 当日均有成交
     close_time = datetime(target.year, target.month, target.day, 15, 5, tzinfo=bj(2026, 1, 1).tzinfo)
@@ -138,6 +139,21 @@ def test_adjustment_change_triggers_full_refetch(settings: Settings, db: Databas
     assert (stored["source"] == "test:fake_daily").all()
     # 先增量请求，发现不一致后再请求完整历史
     assert [c[0] for c in adapter.calls].count("daily") == 2
+
+
+def test_retry_waits_for_delay(settings: Settings, db: Database) -> None:
+    adapter = FakeAdapter()
+    adapter.daily = {"600000": make_daily_bars("600000", 30, seed=1)}
+    target = date.fromisoformat(adapter.daily["600000"]["trade_date"].iloc[-1])
+    col, state = _collector(settings, db, adapter)  # 默认重试间隔 300 秒
+    close_time = datetime(target.year, target.month, target.day, 15, 5, tzinfo=bj(2026, 1, 1).tzinfo)
+    state.latest_spot = make_spot_result(fetched_at=close_time.astimezone(UTC))
+    ctx = _ctx(close_time.replace(hour=16), SessionPhase.POST_CLOSE, target)
+    assert col.update_daily_bars(ctx) is JobResult.MORE
+    # 失败的股票尚未到重试时间：不立即再请求，返回 SKIPPED 而不是 DONE
+    n_calls = len(adapter.calls)
+    assert col.update_daily_bars(ctx) is JobResult.SKIPPED
+    assert len(adapter.calls) == n_calls
 
 
 def test_up_to_date_code_makes_no_request(settings: Settings, db: Database) -> None:

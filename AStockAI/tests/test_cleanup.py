@@ -6,7 +6,7 @@ from datetime import date, datetime, timedelta
 
 import pytest
 
-from cleanup import PROTECTED_TABLES, RETENTION_PLAN, CleanupService
+from cleanup import PROTECTED_TABLES, RETENTION_PLAN, CleanupService, StorageBudget, folder_size_bytes
 from config import MB, Settings
 from database import Database
 from memory_guard import MemoryGuard, MemorySample
@@ -115,3 +115,51 @@ def test_cutoff_never_in_future(settings: Settings, db: Database) -> None:
             assert datetime.fromisoformat(cutoff) < now_utc()
         else:
             assert date.fromisoformat(cutoff) < datetime.now(tz=BEIJING_TZ).date()
+
+
+def test_folder_size_excludes_given_files(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    (tmp_path / "a.bin").write_bytes(b"x" * 100)
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    (sub / "b.bin").write_bytes(b"x" * 50)
+    assert folder_size_bytes(tmp_path) == 150
+    import os
+    assert folder_size_bytes(tmp_path, {os.path.normcase(os.path.abspath(sub / "b.bin"))}) == 100
+
+
+def test_budget_shrinks_db_allowance(settings: Settings, db: Database) -> None:
+    budget = StorageBudget(settings, db)
+    info = budget.apply(force_scan=True)
+    expected = min(int(settings.storage.db_max_gb * 1e9), budget.limit_bytes - info["non_db_bytes"])
+    assert db.max_bytes == expected
+    assert db.soft_bytes == int(expected * 0.9)
+    assert info["total_bytes"] == info["non_db_bytes"] + info["db_bytes"]
+
+
+def test_budget_trim_deletes_oldest_day_first(settings: Settings, db: Database,
+                                              monkeypatch: pytest.MonkeyPatch) -> None:
+    today = now_utc()
+    recent = to_db_ts(today - timedelta(days=1))
+    db.insert_rows("spot_snapshots", SPOT_COLS, [_spot_row(recent, "600000")])
+    cols = ["code", "adjust", "trade_date", "close", "fetched_at", "source"]
+    db.insert_rows("daily_bars", cols, [("600000", "qfq", "2025-01-02", 1.0, recent, "t"),
+                                        ("600000", "qfq", "2025-01-03", 1.0, recent, "t")])
+    svc = _service(settings, db)
+    answers = iter([True, False])  # 第一次检查超量，删除一天后回到预算内
+    monkeypatch.setattr(svc.budget, "needs_trim", lambda: next(answers))
+    result = svc.trim_oldest_until_within_budget()
+    assert result["removed_days"] == ["2025-01-02"]
+    assert [r["trade_date"] for r in db.query("SELECT trade_date FROM daily_bars")] == ["2025-01-03"]
+    assert db.query_one("SELECT COUNT(*) AS n FROM spot_snapshots")["n"] == 1
+    assert db.query_one("SELECT COUNT(*) AS n FROM cleanup_runs WHERE status LIKE 'budget_trim:%'")["n"] == 1
+
+
+def test_budget_trim_never_deletes_today(settings: Settings, db: Database,
+                                         monkeypatch: pytest.MonkeyPatch) -> None:
+    now = to_db_ts(now_utc())
+    db.insert_rows("spot_snapshots", SPOT_COLS, [_spot_row(now, "600000")])
+    svc = _service(settings, db)
+    monkeypatch.setattr(svc.budget, "needs_trim", lambda: True)
+    result = svc.trim_oldest_until_within_budget()
+    assert result["status"] == "nothing_left_to_delete"
+    assert db.query_one("SELECT COUNT(*) AS n FROM spot_snapshots")["n"] == 1

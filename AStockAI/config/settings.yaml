@@ -67,6 +67,7 @@ schedule:
   daily_history_days: 400              # 首次回填的自然日跨度
   max_backoff_sec: 900.0
   daily_job_max_attempts: 3
+  daily_retry_delay_sec: 300.0         # 单只股票日K失败后的重试间隔（最多 3 次）
   daily_update_scope: "all"            # all = 全部A股；focus = 自选股 + 最近一次筛选候选
 
 watchlist:
@@ -124,8 +125,12 @@ anomaly:
   min_amount_yuan: 20000000.0
 
 storage:
-  db_max_gb: 2.0                  # 数据库（含 -wal/-shm）容量上限，达到后暂停行情写入
-  db_soft_limit_gb: 1.8           # 超过后执行紧急清理（只清理高频快照/分钟线）
+  # 整个项目文件夹（含 .venv、数据库、日志、导出文件）总容量上限，十进制GB（2GB = 2,000,000,000 字节）
+  folder_budget_gb: 2.0
+  folder_safety_margin_mb: 150    # 安全余量：总量超过 2GB - 150MB 即开始从最旧数据删除
+  folder_scan_interval_sec: 1800.0  # .venv/日志等非数据库文件的重新扫描间隔
+  db_max_gb: 2.0                  # 数据库自身上限；实际上限还会按文件夹剩余预算自动收紧
+  db_soft_limit_gb: 1.8           # （仅作为配置下限校验用）
   sqlite_cache_kib: 16384         # SQLite 页缓存上限 16 MiB
   cleanup_batch_rows: 20000
   incremental_vacuum_pages: 50000

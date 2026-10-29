@@ -127,7 +127,7 @@
 
 ## work_data/market_status.json（系统状态）
 
-`program`（版本、进程号、启动时间、Python、平台）、`session`、`memory`（级别、阈值、最新采样各口径、Job 硬限制状态与峰值）、`database`（大小、上限、是否暂停写入）、`logs_dir_size_mb`、`trade_calendar`、`data_sources`（各数据集最近成功/失败时间、错误、连续失败次数）、`adapter`（熔断状态、最近一次调用耗时）、`jobs`（各任务最近运行状态）、`recent_errors`（最近 50 条）、`watchlist`、`latest_screen_run`、`spot_crosscheck`。
+`program`（版本、进程号、启动时间、Python、平台）、`session`、`storage_budget`（文件夹合计、数据库与其它文件大小、数据库允许大小、是否超限、最近一次从最旧删除的结果）、`memory`（级别、阈值、最新采样各口径、Job 硬限制状态与峰值）、`database`（大小、上限、是否暂停写入）、`logs_dir_size_mb`、`trade_calendar`、`data_sources`（各数据集最近成功/失败时间、错误、连续失败次数）、`adapter`（熔断状态、最近一次调用耗时）、`jobs`（各任务最近运行状态）、`recent_errors`（最近 50 条）、`watchlist`、`latest_screen_run`、`spot_crosscheck`。
 
 ---
 

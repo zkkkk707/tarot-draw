@@ -111,6 +111,8 @@ class ScheduleConfig:
     daily_history_days: int = 400  # 首次回填的自然日跨度（覆盖约 1 年以上交易日）
     max_backoff_sec: float = 900.0
     daily_job_max_attempts: int = 3
+    # 单只股票日K获取失败后，至少间隔多少秒再重试（最多 3 次）
+    daily_retry_delay_sec: float = 300.0
     # 全A日K更新范围：all = 全部A股；focus = 自选股 + 最近一次筛选候选
     daily_update_scope: str = "all"
 
@@ -180,6 +182,13 @@ class AnomalyConfig:
 
 @dataclass
 class StorageConfig:
+    # 整个项目文件夹（含 .venv、数据库、日志、导出文件）的总容量上限（十进制GB）。
+    # 超过“上限 - 安全余量”时，从最旧的数据开始自动删除，直到回到预算内。
+    folder_budget_gb: float = 2.0
+    folder_safety_margin_mb: int = 150
+    # 扫描非数据库文件（.venv、日志等）总大小的间隔；数据库大小每次检查都实时读取
+    folder_scan_interval_sec: float = 1800.0
+    # 数据库自身的上限；实际生效上限 = min(db_max_gb, 文件夹预算 - 余量 - 其它文件大小)
     db_max_gb: float = 2.0
     db_soft_limit_gb: float = 1.8
     sqlite_cache_kib: int = 16384
@@ -346,6 +355,14 @@ def validate(settings: Settings) -> None:
     s = settings.storage
     if not (0 < s.db_soft_limit_gb < s.db_max_gb):
         raise ConfigError("db_soft_limit_gb 必须小于 db_max_gb")
+    if s.db_max_gb > s.folder_budget_gb:
+        raise ConfigError("db_max_gb 不能大于 folder_budget_gb")
+    if s.folder_safety_margin_mb < 50:
+        raise ConfigError("folder_safety_margin_mb 至少 50（WAL 日志等需要余量）")
+    if s.folder_safety_margin_mb * MB >= s.folder_budget_gb * GB:
+        raise ConfigError("folder_safety_margin_mb 必须小于 folder_budget_gb")
+    if s.folder_scan_interval_sec < 60:
+        raise ConfigError("folder_scan_interval_sec 至少 60 秒")
     for name in ("retention_spot_days", "retention_minute_days", "retention_daily_days",
                  "retention_anomaly_days", "retention_screen_days", "retention_log_days",
                  "retention_runs_days", "emergency_spot_days", "emergency_minute_days"):
@@ -394,6 +411,8 @@ def validate(settings: Settings) -> None:
     for name in ("daily_update_batch_size", "indicator_batch_size", "industry_members_batch_size"):
         if getattr(sc, name) < 1:
             raise ConfigError(f"schedule.{name} 至少为 1")
+    if sc.daily_retry_delay_sec < 0:
+        raise ConfigError("schedule.daily_retry_delay_sec 不能为负数")
     if sc.indicator_batch_size > 500:
         raise ConfigError("schedule.indicator_batch_size 不宜超过 500（控制单批内存与 SQL 参数数量）")
 

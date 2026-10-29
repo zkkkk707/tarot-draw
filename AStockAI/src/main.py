@@ -125,7 +125,7 @@ class App:
 
     def __init__(self, settings: Settings, guard: MemoryGuard) -> None:
         from anomaly_detector import AnomalyService
-        from cleanup import CleanupService, log_dir_size
+        from cleanup import CleanupService, StorageBudget, log_dir_size
         from collector import MarketCollector
         from config import GB
         from database import Database
@@ -158,7 +158,13 @@ class App:
         self.indicators = IndicatorService(settings, self.db, guard, self.state)
         self.screening = ScreeningService(settings, self.db, guard, self.state)
         self.anomalies = AnomalyService(settings, self.db, self.state)
-        self.cleanup = CleanupService(settings, self.db, guard)
+        # 文件夹总容量预算：启动时完整扫描一次（含 .venv），并据此收紧数据库允许大小
+        self.budget = StorageBudget(settings, self.db)
+        info = self.budget.apply(force_scan=True)
+        logger.info("容量预算：文件夹合计 %.1f MB / 预算 %.1f MB（安全余量 %d MB），数据库允许 %.1f MB",
+                    info["total_bytes"] / 1e6, info["budget_bytes"] / 1e6,
+                    settings.storage.folder_safety_margin_mb, info["db_allowed_bytes"] / 1e6)
+        self.cleanup = CleanupService(settings, self.db, guard, budget=self.budget)
         self.scheduler = Scheduler(self.db, self.calendar, guard, settings.schedule.tick_sec,
                                    settings.schedule.max_backoff_sec, settings.schedule.daily_job_max_attempts)
         self.exporter = WorkDataExporter(settings, self.db, self.state, self.calendar, self.status)
@@ -188,10 +194,15 @@ class App:
             "database": {
                 "path": str(self.db.path),
                 "size_mb": round(size / 1e6, 1),
-                "max_gb": self.s.storage.db_max_gb,
-                "soft_limit_gb": self.s.storage.db_soft_limit_gb,
+                "effective_max_mb": round(self.db.max_bytes / 1e6, 1),
                 "write_paused": self.db.write_paused,
                 "pause_reason": self.db.pause_reason,
+            },
+            "storage_budget": {
+                **self.budget.last,
+                "rule": "整个项目文件夹 ≤ folder_budget_gb；超过（预算-余量）或数据库达到允许大小的90%时，"
+                        "从最旧的数据/日志开始自动删除",
+                "last_trim": self.cleanup.last_trim,
             },
             "logs_dir_size_mb": round(self._log_dir_size(self.s.logs_path) / 1e6, 2),
             "trade_calendar": self.calendar.status(),
@@ -258,7 +269,7 @@ class App:
         add(Job("close_snapshot", self.collector.collect_close, E, 60.0, frozenset({P.POST_CLOSE}),
                 eligible=lambda ctx: ctx.now_bj.time() >= time(15, 1), daily=True, day_key=today_key))
         add(Job("export", self.exporter.export, E, sc.export_interval_sec, everywhere))
-        add(Job("db_size_watch", self.cleanup.size_watch_job, E, 600.0, everywhere))
+        add(Job("storage_budget", self.cleanup.size_watch_job, E, 60.0, everywhere))
         add(Job("cleanup", self.cleanup.scheduled_job, H, 300.0, frozenset({P.POST_CLOSE, P.NON_TRADING_DAY}),
                 eligible=lambda ctx: cleanup_start <= ctx.now_bj.time() < cleanup_end,
                 daily=True, day_key=today_key))
@@ -268,7 +279,11 @@ class App:
                 eligible=after_close_ready, daily=True, day_key=target_key))
         add(Job("indicators", self.indicators.run, H, 120.0, off_session,
                 eligible=after_close_ready, daily=True, day_key=target_key))
-        add(Job("screening_close", lambda ctx: self.screening.run(ctx, "close"), H, 120.0,
+        def screening_close(ctx: JobContext) -> JobResult:
+            self.collector.ensure_close_snapshot(ctx)  # 收盘后重启时补抓收盘快照
+            return self.screening.run(ctx, "close")
+
+        add(Job("screening_close", screening_close, H, 120.0,
                 frozenset({P.POST_CLOSE}), eligible=after_close_ready, daily=True, day_key=target_key))
         add(Job("industry_members", self.collector.refresh_industry_members, N, 120.0, off_session,
                 eligible=after_close_ready, daily=True, day_key=today_key))

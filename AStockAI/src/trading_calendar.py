@@ -119,9 +119,12 @@ class TradingCalendar:
         self.last_error = None
         if self._db is not None:
             ts = to_db_ts(now_utc())
-            self._db.insert_rows(  # type: ignore[attr-defined]
-                "trade_calendar", ["trade_date", "source", "fetched_at"],
-                ((date_str(d), self._source, ts) for d in sorted(dates)), mode="REPLACE")
+            try:
+                self._db.insert_rows(  # type: ignore[attr-defined]
+                    "trade_calendar", ["trade_date", "source", "fetched_at"],
+                    ((date_str(d), self._source, ts) for d in sorted(dates)), mode="REPLACE")
+            except Exception as exc:  # 如容量暂停写入：日历仍保存在内存中可用，只是未缓存到数据库
+                logger.warning("交易日历未能缓存到数据库（仍在内存中使用）: %s", exc)
         logger.info("交易日历已更新: %d 个交易日，范围 %s ~ %s", len(dates), self._min, self._max)
         return True
 

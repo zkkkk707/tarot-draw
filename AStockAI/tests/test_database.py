@@ -78,6 +78,23 @@ def test_upsert_stocks_keeps_first_seen(db: Database) -> None:
     assert row["last_seen_at"] == "2026-10-28T00:00:00+00:00"
 
 
+def test_incremental_vacuum_reclaims_all_free_pages(db: Database) -> None:
+    rows = [(f"2026-10-01T00:00:{i % 60:02d}+00:00", "ds" * 200, "src", None, "success") for i in range(3000)]
+    db.insert_rows("collection_runs", ["started_at", "dataset", "source", "finished_at", "status"], rows)
+    db.delete_in_batches("collection_runs", "status = ?", ("success",), batch_rows=1000)
+    db.checkpoint()
+    assert db.page_stats()["freelist_count"] > 1
+    db.incremental_vacuum(0)
+    assert db.page_stats()["freelist_count"] == 0  # 必须全部回收，而不是只回收一页
+
+
+def test_transaction_rollback_tolerates_auto_rollback(db: Database) -> None:
+    with pytest.raises(RuntimeError):
+        with db.transaction() as conn:
+            conn.execute("ROLLBACK")  # 模拟 SQLite 已自动回滚
+            raise RuntimeError("original error")  # 原始异常必须原样抛出
+
+
 def test_refresh_space_state_pauses_and_resumes(tmp_path) -> None:  # type: ignore[no-untyped-def]
     d = Database(tmp_path / "m.db", max_bytes=1, soft_bytes=1)
     d.connect()

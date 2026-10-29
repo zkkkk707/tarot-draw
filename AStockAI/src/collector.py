@@ -39,7 +39,7 @@ from memory_guard import MemoryGuard, TaskKind
 from scheduler import JobContext, JobResult
 from state import RuntimeState
 from timeutil import BEIJING_TZ, date_str, now_utc, to_bj_iso, to_db_ts
-from trading_calendar import TRADING_PHASES
+from trading_calendar import TRADING_PHASES, SessionPhase
 
 logger = logging.getLogger(__name__)
 
@@ -416,6 +416,21 @@ class MarketCollector:
              "index_json", "source", "data_status"], [row]))
         return JobResult.DONE
 
+    def ensure_close_snapshot(self, ctx: JobContext) -> None:
+        """收盘后若内存中没有当日收盘后的全A快照（例如收盘后重启了程序），补抓一次。
+
+        收盘后任务（收盘筛选、日K完整性校验）依赖它；只在目标日就是今天、且处于收盘后时段时执行。
+        """
+        if ctx.phase is not SessionPhase.POST_CLOSE or ctx.target_day != ctx.today:
+            return
+        spot = self.state.latest_spot
+        if spot is not None:
+            fetched_bj = spot.fetched_at.astimezone(BEIJING_TZ)
+            if fetched_bj.date() == ctx.today and fetched_bj.time() >= time(15, 0):
+                return
+        logger.info("内存中没有今日收盘后的全A快照，补抓一次")
+        self.collect_spot(ctx, purpose="close")
+
     # -- 行业成分（每日刷新，分批） -------------------------------------------
     def refresh_industry_members(self, ctx: JobContext) -> JobResult:
         boards = self.state.latest_boards
@@ -564,11 +579,19 @@ class MarketCollector:
             self.db.set_state(init_key, str(len(codes)))
             logger.info("日K更新开始：目标日 %s，共 %d 只股票", target_s, len(codes))
 
+        # 待处理优先；失败重试的股票需间隔 daily_retry_delay_sec 后才再次请求
+        retry_before = to_db_ts(now_utc() - timedelta(seconds=self.s.schedule.daily_retry_delay_sec))
         batch = self.db.query(
             "SELECT code, attempts FROM daily_update_progress WHERE trade_date = ?"
-            " AND status IN ('pending', 'retry') ORDER BY code LIMIT ?",
-            (target_s, self.s.schedule.daily_update_batch_size))
+            " AND (status = 'pending' OR (status = 'retry' AND updated_at <= ?))"
+            " ORDER BY CASE status WHEN 'pending' THEN 0 ELSE 1 END, code LIMIT ?",
+            (target_s, retry_before, self.s.schedule.daily_update_batch_size))
         if not batch:
+            waiting = self.db.query_one(
+                "SELECT COUNT(*) AS n FROM daily_update_progress WHERE trade_date = ? AND status = 'retry'",
+                (target_s,))
+            if waiting is not None and waiting["n"] > 0:
+                return JobResult.SKIPPED  # 还有等待重试的股票，稍后再来
             counts = {r["status"]: r["n"] for r in self.db.query(
                 "SELECT status, COUNT(*) AS n FROM daily_update_progress WHERE trade_date = ? GROUP BY status",
                 (target_s,))}
@@ -578,6 +601,10 @@ class MarketCollector:
                                detail=json.dumps(counts, ensure_ascii=False))
             return JobResult.DONE
 
+        try:
+            self.ensure_close_snapshot(ctx)
+        except DataSourceError as exc:
+            logger.warning("补抓收盘快照失败，本批跳过日K完整性校验: %s", exc)
         traded = self._traded_on(target)
         for r in batch:
             self.guard.checkpoint(TaskKind.HEAVY, "daily_bars")

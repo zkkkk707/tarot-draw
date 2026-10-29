@@ -25,8 +25,14 @@
 
 空间回收：WAL checkpoint(TRUNCATE) → PRAGMA incremental_vacuum；空闲页比例仍很高时，
 在非交易时段执行一次全量 VACUUM（需要约等于数据库大小的临时磁盘空间）。
-容量控制：数据库（含 -wal/-shm）≥ db_soft_limit_gb 时先按“紧急保留天数”清理高频数据；
-仍 ≥ db_max_gb 时暂停行情写入（不会删除日K、统计等重要数据）。
+
+文件夹总容量预算（StorageBudget，默认 2GB = 2,000,000,000 字节，含 .venv、数据库、日志、导出文件）
+- 数据库实际允许大小 = min(db_max_gb, 预算 - 安全余量 - 其它文件大小)，每 60 秒检查一次；
+  达到该值即暂停行情写入，回落到其 90% 以下才恢复。
+- 一旦超出，按“从最旧开始”自动删除：比较最旧的日志文件与数据库中最旧的一天，删除更旧的那一份；
+  数据库每删一天就回收空间并重新测量，直到数据库回到允许大小的 90% 以下且总量在预算内。
+- 不删除当天（UTC 日期）的数据；不删除受保护的长期小表（每日统计、清理记录、交易日历、股票列表）；
+  不删除正在写入的当前日志文件。全部可删内容删完仍超标（例如 .venv 本身过大）时，保持暂停写入并告警。
 """
 
 from __future__ import annotations
@@ -36,13 +42,15 @@ import logging
 import os
 import time
 from dataclasses import dataclass
+from datetime import date, datetime, timedelta
+from datetime import time as dtime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
-from config import GB, Settings
+from config import GB, MB, Settings
 from database import Database
 from memory_guard import MemoryGuard, TaskKind
-from timeutil import date_cutoff_days, now_utc, to_db_ts, utc_cutoff_days
+from timeutil import UTC, date_cutoff_days, now_utc, to_db_ts, utc_cutoff_days
 from trading_calendar import SessionPhase
 
 if TYPE_CHECKING:
@@ -86,11 +94,113 @@ RETENTION_PLAN: tuple[RetentionRule, ...] = (
 assert not any(r.table in PROTECTED_TABLES for r in RETENTION_PLAN), "受保护表不得出现在清理计划中"
 
 
+MAX_TRIM_STEPS = 1000  # 单次超量处理最多删除的“天数”步数，防止无限循环
+
+
+def folder_size_bytes(root: Path, exclude: set[str] | None = None) -> int:
+    """递归统计文件夹内全部普通文件大小（不跟随符号链接）。exclude 为需排除文件的规范化绝对路径。"""
+    excluded = exclude or set()
+    total = 0
+    stack = [str(root)]
+    while stack:
+        current = stack.pop()
+        try:
+            entries = os.scandir(current)
+        except OSError:
+            continue
+        with entries:
+            for entry in entries:
+                try:
+                    if entry.is_symlink():
+                        continue
+                    if entry.is_dir(follow_symlinks=False):
+                        stack.append(entry.path)
+                    elif entry.is_file(follow_symlinks=False):
+                        if _norm(entry.path) in excluded:
+                            continue
+                        total += entry.stat(follow_symlinks=False).st_size
+                except OSError:
+                    continue
+    return total
+
+
+def _norm(path: str | Path) -> str:
+    return os.path.normcase(os.path.abspath(str(path)))
+
+
+class StorageBudget:
+    """项目文件夹总容量预算：测量、换算数据库允许大小、驱动写入暂停。"""
+
+    def __init__(self, settings: Settings, db: Database,
+                 clock: Callable[[], float] = time.monotonic) -> None:
+        self.s = settings
+        self.db = db
+        self._clock = clock
+        st = settings.storage
+        self.budget_bytes = int(st.folder_budget_gb * GB)
+        self.margin_bytes = int(st.folder_safety_margin_mb * MB)
+        self._non_db: int | None = None
+        self._scanned_at = -1e18
+        self.last: dict[str, Any] = {}
+
+    def _db_files(self) -> set[str]:
+        base = str(self.db.path)
+        return {_norm(base), _norm(base + "-wal"), _norm(base + "-shm"), _norm(base + "-journal")}
+
+    def invalidate(self) -> None:
+        self._non_db = None
+
+    def non_db_bytes(self, force: bool = False) -> int:
+        if (force or self._non_db is None
+                or self._clock() - self._scanned_at >= self.s.storage.folder_scan_interval_sec):
+            self._non_db = folder_size_bytes(self.s.root_path, self._db_files())
+            self._scanned_at = self._clock()
+        return self._non_db
+
+    @property
+    def limit_bytes(self) -> int:
+        """总量必须保持在该值以下（预算 - 安全余量）。"""
+        return self.budget_bytes - self.margin_bytes
+
+    def apply(self, force_scan: bool = False) -> dict[str, Any]:
+        non_db = self.non_db_bytes(force_scan)
+        allowed = min(int(self.s.storage.db_max_gb * GB), self.limit_bytes - non_db)
+        allowed = max(allowed, 0)
+        self.db.max_bytes = allowed
+        self.db.soft_bytes = int(allowed * 0.9)
+        db_bytes = self.db.refresh_space_state()
+        total = non_db + db_bytes
+        self.last = {
+            "folder": str(self.s.root_path),
+            "budget_bytes": self.budget_bytes,
+            "safety_margin_bytes": self.margin_bytes,
+            "non_db_bytes": non_db,
+            "db_bytes": db_bytes,
+            "total_bytes": total,
+            "db_allowed_bytes": allowed,
+            "total_mb": round(total / MB, 1),
+            "budget_mb": round(self.budget_bytes / MB, 1),
+            "over_limit": total >= self.limit_bytes or db_bytes >= allowed,
+            "write_paused": self.db.write_paused,
+        }
+        return self.last
+
+    def needs_trim(self) -> bool:
+        info = self.last
+        return bool(info) and (info["total_bytes"] >= self.limit_bytes
+                               or info["db_bytes"] >= self.db.soft_bytes)
+
+
 class CleanupService:
-    def __init__(self, settings: Settings, db: Database, guard: MemoryGuard) -> None:
+    def __init__(self, settings: Settings, db: Database, guard: MemoryGuard,
+                 budget: StorageBudget | None = None) -> None:
         self.s = settings
         self.db = db
         self.guard = guard
+        self.budget = budget if budget is not None else (StorageBudget(settings, db) if db is not None else None)
+        self.last_trim: dict[str, Any] | None = None
+        self._integrity_checked_at = -1e18
+        self._integrity_ok = True
 
     # -- 截止条件 -------------------------------------------------------------
     def _cutoff(self, rule: RetentionRule, emergency: bool) -> tuple[str, int]:
@@ -222,21 +332,144 @@ class CleanupService:
         return JobResult.DONE
 
     def size_watch_job(self, ctx: "JobContext") -> "JobResult":
-        """周期检查数据库容量；超过软上限时执行紧急清理，仍超过硬上限则保持写入暂停。"""
+        """每 60 秒检查文件夹总容量；超出预算时从最旧的内容开始自动删除。"""
         from scheduler import JobResult
 
-        size = self.db.refresh_space_state()
-        soft = int(self.s.storage.db_soft_limit_gb * GB)
-        if size < soft:
+        if self.budget is None:
+            return JobResult.SKIPPED
+        self.budget.apply()
+        if not self.budget.needs_trim():
             return JobResult.DONE
-        logger.warning("数据库大小 %.2f GB 超过软上限 %.2f GB，执行紧急清理", size / GB,
-                       self.s.storage.db_soft_limit_gb)
-        self.run(ctx, emergency=True)
-        size = self.db.refresh_space_state()
-        if self.db.write_paused:
-            logger.critical("紧急清理后数据库仍为 %.2f GB，继续暂停行情写入；重要数据不会被自动删除，"
-                            "请检查保留天数配置或手动归档", size / GB)
+        info = self.budget.last
+        logger.warning("容量超出预算：文件夹合计 %.1f MB（上限 %.1f MB，含余量），数据库 %.1f MB / 允许 %.1f MB，"
+                       "开始从最旧数据删除", info["total_bytes"] / MB, self.budget.limit_bytes / MB,
+                       info["db_bytes"] / MB, info["db_allowed_bytes"] / MB)
+        self.trim_oldest_until_within_budget()
         return JobResult.DONE
+
+    # -- 超预算时：从最旧开始删除 -------------------------------------------------
+    def _integrity_ok_cached(self) -> bool:
+        """完整性检查较慢，超量处理时最多每 6 小时做一次。"""
+        if time.monotonic() - self._integrity_checked_at >= 6 * 3600:
+            result = self.db.quick_check()
+            self._integrity_ok = result == "ok"
+            self._integrity_checked_at = time.monotonic()
+            if not self._integrity_ok:
+                logger.critical("数据库完整性检查未通过（%s），不执行自动删除，保持写入暂停", result)
+        return self._integrity_ok
+
+    def _oldest_db_day(self) -> str | None:
+        """所有可删除表中最旧数据所在的日期（时间戳列按 UTC 日期，交易日期列直接取值）。"""
+        oldest: str | None = None
+        for rule in RETENTION_PLAN:
+            row = self.db.query_one(f"SELECT MIN({rule.column}) AS m FROM {rule.table}")
+            value = None if row is None else row["m"]
+            if not value:
+                continue
+            day = str(value)[:10]
+            if oldest is None or day < oldest:
+                oldest = day
+        return oldest
+
+    def _oldest_log_file(self) -> tuple[Path, str] | None:
+        logs_dir = self.s.logs_path
+        if not logs_dir.is_dir():
+            return None
+        active = self.s.logging.file_name
+        candidates: list[tuple[float, Path]] = []
+        for p in logs_dir.iterdir():
+            if p.is_file() and not p.is_symlink() and ".log" in p.name and p.name != active:
+                try:
+                    candidates.append((p.stat().st_mtime, p))
+                except OSError:
+                    continue
+        if not candidates:
+            return None
+        mtime, path = min(candidates)
+        return path, datetime.fromtimestamp(mtime, tz=UTC).date().isoformat()
+
+    def _delete_db_day(self, day: str) -> int:
+        next_midnight = to_db_ts(datetime.combine(date.fromisoformat(day) + timedelta(days=1),
+                                                  dtime(0, 0), tzinfo=UTC))
+        deleted = 0
+        for rule in RETENTION_PLAN:
+            if rule.table in PROTECTED_TABLES:
+                raise RuntimeError(f"拒绝清理受保护表 {rule.table}")
+            if rule.kind == "ts":
+                deleted += self.db.delete_in_batches(rule.table, f"{rule.column} < ?", (next_midnight,),
+                                                     self.s.storage.cleanup_batch_rows)
+            else:
+                deleted += self.db.delete_in_batches(rule.table, f"{rule.column} <= ?", (day,),
+                                                     self.s.storage.cleanup_batch_rows)
+        return deleted
+
+    def _reclaim_all(self) -> None:
+        self.db.checkpoint()
+        if self.db.page_stats()["auto_vacuum"] == 2:
+            self.db.incremental_vacuum(0)  # 回收全部空闲页
+        else:
+            self.db.full_vacuum()  # 旧库未启用增量回收时只能全量 VACUUM
+        self.db.checkpoint()
+
+    def trim_oldest_until_within_budget(self) -> dict[str, Any]:
+        assert self.budget is not None
+        started = to_db_ts(now_utc())
+        before = self.budget.last.get("total_bytes", 0)
+        db_before = self.db.size_bytes()
+        removed_days: list[str] = []
+        removed_logs: list[str] = []
+        rows = 0
+        status = "within_budget"
+        today_utc = now_utc().date().isoformat()
+        if not self._integrity_ok_cached():
+            status = "aborted_integrity"
+        else:
+            for _ in range(MAX_TRIM_STEPS):
+                info = self.budget.apply()
+                if not self.budget.needs_trim():
+                    status = "within_budget"
+                    break
+                db_day = self._oldest_db_day()
+                log = self._oldest_log_file()
+                db_day = db_day if (db_day is not None and db_day < today_utc) else None
+                if log is not None and (db_day is None or log[1] <= db_day):
+                    path, _day = log
+                    try:
+                        path.unlink()
+                        removed_logs.append(path.name)
+                    except OSError as exc:
+                        logger.warning("删除旧日志 %s 失败: %s", path, exc)
+                        status = "log_delete_failed"
+                        break
+                    self.budget.invalidate()
+                    continue
+                if db_day is None:
+                    status = "nothing_left_to_delete"
+                    logger.critical("可删除的历史数据已全部删除，总量仍为 %.1f MB，超过上限 %.1f MB；"
+                                    "保持暂停写入。请检查 .venv 等非数据文件是否过大",
+                                    info["total_bytes"] / MB, self.budget.limit_bytes / MB)
+                    break
+                rows += self._delete_db_day(db_day)
+                removed_days.append(db_day)
+                self._reclaim_all()
+            else:
+                status = "step_limit_reached"
+        after = self.budget.apply()
+        self.last_trim = {
+            "at": started, "status": status, "removed_days": removed_days[:50],
+            "removed_day_count": len(removed_days), "removed_rows": rows, "removed_logs": removed_logs[:50],
+            "total_bytes_before": before, "total_bytes_after": after["total_bytes"],
+        }
+        self._record(started, f"budget_trim:{status}", db_before, after["db_bytes"],
+                     {"removed_days": removed_days, "removed_rows": rows, "removed_logs": removed_logs},
+                     json.dumps({"total_before": before, "total_after": after["total_bytes"],
+                                 "limit": self.budget.limit_bytes}))
+        if removed_days or removed_logs:
+            logger.warning("容量预算处理完成（%s）：删除最旧 %d 天数据（%s ~ %s）共 %d 行、%d 个旧日志；"
+                           "文件夹合计 %.1f MB → %.1f MB", status, len(removed_days),
+                           removed_days[0] if removed_days else "-", removed_days[-1] if removed_days else "-",
+                           rows, len(removed_logs), before / MB, after["total_bytes"] / MB)
+        return self.last_trim
 
 
 def _free_disk_bytes(path: Path) -> int | None:

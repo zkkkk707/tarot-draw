@@ -242,6 +242,10 @@ class AnomalyService:
         events = (detect_breadth_event(spot, self.state.latest_breadth, self.state.breadth_history, cfg, trade_date)
                   + detect_sector_events(spot, boards, members, cfg, trade_date)
                   + detect_stock_events(spot, indicators, cfg, trade_date))
+        # 先去掉当日已记录过的事件，再应用条数上限，避免已存在的事件持续占用名额
+        existing = {r["dedup_key"] for r in self.db.query(
+            "SELECT dedup_key FROM anomalies WHERE trade_date = ?", (trade_date,))}
+        events = [e for e in events if e["dedup_key"] not in existing]
         if len(events) > cfg.max_events_per_run:
             logger.warning("本轮异动 %d 条超过上限 %d，按市场/板块/成交额优先保留", len(events), cfg.max_events_per_run)
             events = events[: cfg.max_events_per_run]

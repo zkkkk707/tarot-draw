@@ -474,7 +474,9 @@ class Database:
         try:
             yield conn
         except BaseException:
-            conn.execute("ROLLBACK")
+            # SQLITE_FULL / NOMEM / IOERR 等错误时 SQLite 可能已自动回滚，再次 ROLLBACK 会掩盖原始异常
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
             raise
         else:
             conn.execute("COMMIT")
@@ -641,7 +643,11 @@ class Database:
         self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
     def incremental_vacuum(self, pages: int) -> None:
-        self.conn.execute(f"PRAGMA incremental_vacuum({int(pages)})")
+        """pages <= 0 表示回收全部空闲页。
+
+        注意：该 PRAGMA 每回收一页产生一行结果，必须 fetchall() 把语句执行完，
+        否则 Python 只执行一步（只回收一页）。"""
+        self.conn.execute(f"PRAGMA incremental_vacuum({int(pages)})").fetchall()
 
     def full_vacuum(self) -> None:
         self.conn.execute("VACUUM")
